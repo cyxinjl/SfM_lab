@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import random
 from collections import defaultdict
+from scipy.optimize import least_squares
 
 def create_folder(folder_path):                     #负责创建用于存储结果的文件夹
     folder_path = Path(folder_path)
@@ -325,6 +326,23 @@ def estimate_initial_K_from_image(image, focal_scale=1.2): # 根据图像尺寸�
     ], dtype=np.float64)
     return K
 
+def build_K_from_intrinsics(camera_intrinsics):
+    """
+    根据 camera_intrinsics 字典构造相机内参矩阵 K。
+    K:3×3 相机内参矩阵。
+    """
+    f = camera_intrinsics["f"]
+    cx = camera_intrinsics["cx"]
+    cy = camera_intrinsics["cy"]
+
+    K = np.array([
+        [f,   0.0, cx],
+        [0.0, f,   cy],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float64)
+
+    return K
+
 def enforce_essential_matrix_constraints(E):
     """
     对 E 做 SVD 修正，使其更接近合法本质矩阵。本质矩阵需要满足的条件有：
@@ -624,6 +642,1339 @@ def select_initial_pair(
 
     return best_result
 
+def select_next_edge_for_pnp(
+    pair_infos,
+    registered_images,
+    track_to_point3D,
+    observation_to_track,
+    min_common_points=20
+):
+    """
+    从 G 中选择下一条用于 PnP 的边 e。
+
+    选择标准：
+        1. 这条边连接一张已注册图像和一张未注册图像；
+        2. 这条边中的 tracks 有尽可能多已经被重建成 3D 点；
+        3. 这些 3D 点可以和未注册图像中的 2D keypoints 构成 PnP 对应。
+
+    返回：
+        best_pair: 选中的边 (i, j)
+        best_new_image: 需要注册的新图像 id
+        best_registered_image: 已注册图像 id
+        best_score: 可用 3D-2D 对应数量
+    """
+
+    best_pair = None
+    best_new_image = None
+    best_registered_image = None
+    best_score = 0
+
+    for pair, pair_info in pair_infos.items():
+        i, j = pair
+        i_registered = i in registered_images
+        j_registered = j in registered_images
+
+        # 必须是一张已注册，一张未注册
+        if i_registered == j_registered:
+            continue
+
+        if i_registered:
+            registered_image = i
+            new_image = j
+        else:
+            registered_image = j
+            new_image = i
+
+        inlier_matches = pair_info["inlier_matches"]
+        common_track_ids = set()
+        for m in inlier_matches:
+            # 注意 pair_infos 的 key 是 (i, j)，DMatch 的 queryIdx 属于 i，trainIdx 属于 j
+            obs_i = (i, m.queryIdx)
+            obs_j = (j, m.trainIdx)
+
+            if new_image == i:
+                obs_new = obs_i
+            else:
+                obs_new = obs_j
+
+            track_id = observation_to_track.get(obs_new, None)
+
+            if track_id is None:
+                continue
+
+            if track_id in track_to_point3D:
+                common_track_ids.add(track_id)
+
+        score = len(common_track_ids)
+        if score > best_score:
+            best_score = score
+            best_pair = pair
+            best_new_image = new_image
+            best_registered_image = registered_image
+    if best_score < min_common_points:
+        return None, None, None, best_score
+
+    return best_pair, best_new_image, best_registered_image, best_score
+
+def collect_pnp_correspondences_from_edge(
+    pair,
+    pair_info,
+    new_image_id,
+    observation_to_track,
+    track_to_point3D,
+    points3D,
+    all_results
+):
+    """
+    从一条边中收集 PnP 所需的 3D-2D 对应关系。
+
+    返回：
+        object_points: N×3，已有三维点
+        image_points: N×2，新图像中的二维点
+        used_track_ids: 对应的 track_id
+    """
+
+    i, j = pair
+    inlier_matches = pair_info["inlier_matches"]
+    object_points = []
+    image_points = []
+    used_track_ids = []
+    kp_new = all_results[new_image_id]["keypoints"]
+    used = set()
+
+    for m in inlier_matches:
+        obs_i = (i, m.queryIdx)
+        obs_j = (j, m.trainIdx)
+
+        if new_image_id == i:
+            obs_new = obs_i
+            keypoint_id_new = m.queryIdx
+        elif new_image_id == j:
+            obs_new = obs_j
+            keypoint_id_new = m.trainIdx
+        else:
+            continue
+
+        track_id = observation_to_track.get(obs_new, None)
+
+        if track_id is None:
+            continue
+        if track_id not in track_to_point3D:
+            continue
+        if track_id in used:
+            continue
+
+        point3D_id = track_to_point3D[track_id]
+        X = points3D[point3D_id]["xyz"]
+        x = kp_new[keypoint_id_new].pt
+
+        object_points.append(X)
+        image_points.append(x)
+        used_track_ids.append(track_id)
+
+        used.add(track_id)
+
+    object_points = np.asarray(object_points, dtype=np.float64)
+    image_points = np.asarray(image_points, dtype=np.float64)
+
+    return object_points, image_points, used_track_ids
+
+def register_image_by_pnp(
+    pair,
+    pair_info,
+    new_image_id,
+    observation_to_track,
+    track_to_point3D,
+    points3D,
+    all_results,
+    camera_intrinsics,
+    min_pnp_points=20,
+    reprojection_error=8.0,
+    confidence=0.99,
+    iterations_count=1000
+):
+    """
+    使用 PnP RANSAC 估计新图像的相机位姿。
+
+    返回：
+        success
+        R
+        t
+        pnp_inlier_track_ids
+    """
+
+    K = build_K_from_intrinsics(camera_intrinsics)
+
+    object_points, image_points, used_track_ids = collect_pnp_correspondences_from_edge(
+        pair=pair,
+        pair_info=pair_info,
+        new_image_id=new_image_id,
+        observation_to_track=observation_to_track,
+        track_to_point3D=track_to_point3D,
+        points3D=points3D,
+        all_results=all_results
+    )
+
+    if len(object_points) < min_pnp_points:
+        return False, None, None, [], {
+            "reason": "PnP 可用 3D-2D 对应点不足",
+            "num_correspondences": len(object_points)
+        }
+
+    try:
+        success, rvec, tvec, inliers = cv2.solvePnPRansac(
+            objectPoints=object_points,
+            imagePoints=image_points,
+            cameraMatrix=K,
+            distCoeffs=None,
+            iterationsCount=iterations_count,
+            reprojectionError=reprojection_error,
+            confidence=confidence,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+    except cv2.error as e:
+        return False, None, None, [], {
+            "reason": "solvePnPRansac 出错",
+            "error": str(e)
+        }
+
+    if not success or inliers is None:
+        return False, None, None, [], {
+            "reason": "PnP 估计失败",
+            "num_correspondences": len(object_points)
+        }
+
+    inliers = inliers.ravel()
+
+    if len(inliers) < min_pnp_points:
+        return False, None, None, [], {
+            "reason": "PnP RANSAC 内点不足",
+            "num_pnp_inliers": len(inliers)
+        }
+
+    R, _ = cv2.Rodrigues(rvec)
+    t = tvec.reshape(3, 1)
+
+    pnp_inlier_track_ids = [
+        used_track_ids[idx] for idx in inliers
+    ]
+
+    return True, R, t, pnp_inlier_track_ids, {
+        "num_correspondences": len(object_points),
+        "num_pnp_inliers": len(inliers)
+    }
+
+def from_homogeneous(points_h, eps=1e-8):
+    points_h = np.asarray(points_h, dtype=np.float64)
+    w = points_h[:, -1]
+
+    points = np.full(
+        (points_h.shape[0], points_h.shape[1] - 1),
+        np.nan,
+        dtype=np.float64
+    )
+
+    valid = np.abs(w) > eps
+    points[valid] = points_h[valid, :-1] / w[valid, None]
+
+    return points
+
+def project_point(K, R, t, X):
+    X = X.reshape(3, 1)
+    x = K @ (R @ X + t.reshape(3, 1))
+    if abs(x[2, 0]) < 1e-12:
+        return None
+    return np.array([x[0, 0] / x[2, 0], x[1, 0] / x[2, 0]], dtype=np.float64)
+
+def is_triangulated_point_valid(
+    X,
+    obs1,
+    obs2,
+    all_results,
+    camera_poses,
+    camera_intrinsics,
+    reproj_error_threshold=5.0
+):
+    """
+    检查三角化点是否有效。
+    """
+
+    if X is None:
+        return False
+
+    if not np.isfinite(X).all():
+        return False
+
+    K = build_K_from_intrinsics(camera_intrinsics)
+
+    image_id1, kp_id1 = obs1
+    image_id2, kp_id2 = obs2
+
+    if image_id1 not in camera_poses:
+        return False
+
+    if image_id2 not in camera_poses:
+        return False
+
+    R1 = camera_poses[image_id1]["R"]
+    t1 = camera_poses[image_id1]["t"]
+
+    R2 = camera_poses[image_id2]["R"]
+    t2 = camera_poses[image_id2]["t"]
+
+    X_cam1 = R1 @ X.reshape(3, 1) + t1.reshape(3, 1)
+    X_cam2 = R2 @ X.reshape(3, 1) + t2.reshape(3, 1)
+
+    if X_cam1[2, 0] <= 0 or X_cam2[2, 0] <= 0:
+        return False
+
+    x1_proj = project_point(K, R1, t1, X)
+    x2_proj = project_point(K, R2, t2, X)
+
+    if x1_proj is None or x2_proj is None:
+        return False
+
+    kp1 = all_results[image_id1]["keypoints"][kp_id1].pt
+    kp2 = all_results[image_id2]["keypoints"][kp_id2].pt
+
+    x1_obs = np.array(kp1, dtype=np.float64)
+    x2_obs = np.array(kp2, dtype=np.float64)
+
+    err1 = np.linalg.norm(x1_proj - x1_obs)
+    err2 = np.linalg.norm(x2_proj - x2_obs)
+
+    if err1 > reproj_error_threshold or err2 > reproj_error_threshold:
+        return False
+
+    return True
+
+def triangulate_two_observations(
+    obs1,
+    obs2,
+    all_results,
+    camera_poses,
+    camera_intrinsics
+):
+    """
+    根据两个已注册相机中的观测三角化一个三维点。
+
+    obs1, obs2:
+        (image_id, keypoint_id)
+    """
+
+    image_id1, kp_id1 = obs1
+    image_id2, kp_id2 = obs2
+
+    if image_id1 not in camera_poses:
+        print(f"跳过三角化：image_id={image_id1} 没有相机位姿。")
+        return None
+
+    if image_id2 not in camera_poses:
+        print(f"跳过三角化：image_id={image_id2} 没有相机位姿。")
+        return None
+
+    K = build_K_from_intrinsics(camera_intrinsics)
+
+    R1 = camera_poses[image_id1]["R"]
+    t1 = camera_poses[image_id1]["t"]
+
+    R2 = camera_poses[image_id2]["R"]
+    t2 = camera_poses[image_id2]["t"]
+
+    P1 = build_projection_matrix(K, R1, t1)
+    P2 = build_projection_matrix(K, R2, t2)
+
+    x1 = np.array(
+        all_results[image_id1]["keypoints"][kp_id1].pt,
+        dtype=np.float64
+    )
+
+    x2 = np.array(
+        all_results[image_id2]["keypoints"][kp_id2].pt,
+        dtype=np.float64
+    )
+
+    points_4d = cv2.triangulatePoints(
+        P1,
+        P2,
+        x1.reshape(2, 1),
+        x2.reshape(2, 1)
+    )
+
+    X = from_homogeneous(points_4d.T)[0]
+
+    return X
+
+def triangulate_new_tracks_after_registering_image(
+    new_image_id,
+    pair_infos,
+    valid_tracks,
+    observation_to_track,
+    track_to_point3D,
+    point3D_to_track,
+    points3D,
+    camera_poses,
+    registered_images,
+    all_results,
+    camera_intrinsics,
+    reproj_error_threshold=5.0
+):
+    """
+    新图像注册成功后，三角化新的 tracks。
+
+    安全版本：
+        1. 不仅检查 registered_images；
+        2. 更重要的是检查 camera_poses 中是否真的有该图像的 R,t；
+        3. 避免出现 KeyError。
+    """
+
+    new_points_count = 0
+
+    # 如果新图像没有相机位姿，不能三角化
+    if new_image_id not in camera_poses:
+        print(f"错误：new_image_id={new_image_id} 不在 camera_poses 中，无法三角化。")
+        return 0
+
+    # 保证 registered_images 和 camera_poses 尽量一致
+    registered_images = set(registered_images)
+    pose_image_ids = set(camera_poses.keys())
+
+    missing_pose_images = registered_images - pose_image_ids
+
+    if len(missing_pose_images) > 0:
+        print("警告：registered_images 中存在没有 camera_poses 的图像：")
+        print(missing_pose_images)
+        print("本次三角化将只使用 camera_poses 中已有位姿的图像。")
+
+    next_point_id = 0
+    if len(points3D) > 0:
+        next_point_id = max(points3D.keys()) + 1
+
+    for track_id, track in enumerate(valid_tracks):
+
+        # 已经有 3D 点的 track 不再重复三角化
+        if track_id in track_to_point3D:
+            continue
+
+        # track 中必须包含新注册图像的观测
+        obs_new_list = [
+            obs for obs in track
+            if obs[0] == new_image_id
+        ]
+
+        if len(obs_new_list) == 0:
+            continue
+
+        obs_new = obs_new_list[0]
+
+        # 找到该 track 中另一张已经有相机位姿的图像观测
+        candidate_obs = [
+            obs for obs in track
+            if obs[0] in camera_poses and obs[0] != new_image_id
+        ]
+
+        if len(candidate_obs) == 0:
+            continue
+
+        # 简化处理：先选择第一个已有位姿的旧观测
+        obs_old = candidate_obs[0]
+
+        # 再次保险检查
+        if obs_old[0] not in camera_poses:
+            continue
+
+        if obs_new[0] not in camera_poses:
+            continue
+
+        try:
+            X = triangulate_two_observations(
+                obs1=obs_old,
+                obs2=obs_new,
+                all_results=all_results,
+                camera_poses=camera_poses,
+                camera_intrinsics=camera_intrinsics
+            )
+        except KeyError as e:
+            print(f"三角化跳过：缺少相机位姿 {e}")
+            continue
+
+        if X is None:
+            continue
+
+        valid = is_triangulated_point_valid(
+            X=X,
+            obs1=obs_old,
+            obs2=obs_new,
+            all_results=all_results,
+            camera_poses=camera_poses,
+            camera_intrinsics=camera_intrinsics,
+            reproj_error_threshold=reproj_error_threshold
+        )
+
+        if not valid:
+            continue
+
+        point_id = next_point_id
+        next_point_id += 1
+
+        points3D[point_id] = {
+            "xyz": X,
+            "track_id": track_id,
+            "observations": track
+        }
+
+        track_to_point3D[track_id] = point_id
+        point3D_to_track[point_id] = track_id
+
+        new_points_count += 1
+
+    return new_points_count
+
+def run_bundle_adjustment_fixed_K(
+    camera_poses,
+    points3D,
+    registered_images,
+    all_results,
+    camera_intrinsics,
+    fixed_image_id=None,
+    max_nfev=50
+):
+    """
+    简化版 Bundle Adjustment。
+
+    优化变量：
+        1. 已注册相机的 rvec, tvec
+        2. 已重建三维点 xyz
+
+    固定：
+        1. 相机内参 K
+        2. fixed_image_id 对应的相机位姿，用于固定坐标系尺度和规范自由度
+
+    注意：
+        这是教学版 BA，适合你当前程序接入。
+        后续可以扩展为优化 K 的 BA。
+    """
+
+    if fixed_image_id is None:
+        fixed_image_id = min(registered_images)
+
+    K = build_K_from_intrinsics(camera_intrinsics)
+
+    # 只优化有足够观测的点
+    point_ids = list(points3D.keys())
+    image_ids = sorted(list(registered_images))
+
+    variable_image_ids = [
+        image_id for image_id in image_ids
+        if image_id != fixed_image_id
+    ]
+
+    image_id_to_var_idx = {
+        image_id: idx for idx, image_id in enumerate(variable_image_ids)
+    }
+
+    point_id_to_var_idx = {
+        point_id: idx for idx, point_id in enumerate(point_ids)
+    }
+
+    # 收集 BA 观测
+    observations = []
+
+    for point_id in point_ids:
+        point = points3D[point_id]
+        for obs in point["observations"]:
+            image_id, kp_id = obs
+
+            if image_id not in registered_images:
+                continue
+
+            x_obs = np.array(
+                all_results[image_id]["keypoints"][kp_id].pt,
+                dtype=np.float64
+            )
+
+            observations.append((image_id, point_id, x_obs))
+
+    if len(observations) < 10:
+        print("BA 观测数量太少，跳过。")
+        return camera_poses, points3D
+
+    # 打包优化变量
+    x0_list = []
+
+    for image_id in variable_image_ids:
+        R = camera_poses[image_id]["R"]
+        t = camera_poses[image_id]["t"].reshape(3, 1)
+
+        rvec, _ = cv2.Rodrigues(R)
+
+        x0_list.extend(rvec.ravel())
+        x0_list.extend(t.ravel())
+
+    for point_id in point_ids:
+        X = points3D[point_id]["xyz"]
+        x0_list.extend(X.ravel())
+
+    x0 = np.array(x0_list, dtype=np.float64)
+
+    num_cameras = len(variable_image_ids)
+    num_points = len(point_ids)
+
+    def unpack_params(params):
+        poses = {}
+
+        offset = 0
+
+        # 固定相机
+        poses[fixed_image_id] = {
+            "R": camera_poses[fixed_image_id]["R"],
+            "t": camera_poses[fixed_image_id]["t"]
+        }
+
+        # 可变相机
+        for image_id in variable_image_ids:
+            rvec = params[offset:offset + 3]
+            offset += 3
+
+            tvec = params[offset:offset + 3].reshape(3, 1)
+            offset += 3
+
+            R, _ = cv2.Rodrigues(rvec)
+
+            poses[image_id] = {
+                "R": R,
+                "t": tvec
+            }
+
+        # 三维点
+        points = {}
+
+        for point_id in point_ids:
+            X = params[offset:offset + 3]
+            offset += 3
+            points[point_id] = X
+
+        return poses, points
+
+    def residual_function(params):
+        poses, points = unpack_params(params)
+
+        residuals = []
+
+        for image_id, point_id, x_obs in observations:
+            R = poses[image_id]["R"]
+            t = poses[image_id]["t"]
+            X = points[point_id]
+
+            x_proj = project_point(K, R, t, X)
+
+            if x_proj is None:
+                residuals.extend([1000.0, 1000.0])
+                continue
+
+            residual = x_proj - x_obs
+
+            residuals.extend(residual.tolist())
+
+        return np.array(residuals, dtype=np.float64)
+
+    result = least_squares(
+        residual_function,
+        x0,
+        loss="huber",
+        f_scale=3.0,
+        max_nfev=max_nfev,
+        verbose=0
+    )
+
+    optimized_poses, optimized_points = unpack_params(result.x)
+
+    # 写回 camera_poses
+    for image_id in optimized_poses:
+        camera_poses[image_id]["R"] = optimized_poses[image_id]["R"]
+        camera_poses[image_id]["t"] = optimized_poses[image_id]["t"]
+
+    # 写回 points3D
+    for point_id in optimized_points:
+        points3D[point_id]["xyz"] = optimized_points[point_id]
+
+    print(
+        f"BA 完成：cost={result.cost:.4f}, "
+        f"observations={len(observations)}, "
+        f"cameras={len(registered_images)}, "
+        f"points={len(points3D)}"
+    )
+
+    return camera_poses, points3D
+
+def project_point_with_f(f, cx, cy, R, t, X):
+    """
+    使用 SIMPLE_PINHOLE 模型投影一个三维点。
+
+    K = [ f  0  cx
+          0  f  cy
+          0  0   1 ]
+
+    返回：
+        图像坐标 [u, v]
+    """
+
+    X = X.reshape(3, 1)
+    t = t.reshape(3, 1)
+
+    X_cam = R @ X + t
+
+    z = X_cam[2, 0]
+
+    if abs(z) < 1e-12:
+        return None
+
+    x = X_cam[0, 0] / z
+    y = X_cam[1, 0] / z
+
+    u = f * x + cx
+    v = f * y + cy
+
+    return np.array([u, v], dtype=np.float64)
+
+def run_bundle_adjustment_refine_focal(
+    camera_poses,
+    points3D,
+    registered_images,
+    all_results,
+    camera_intrinsics,
+    fixed_image_id=None,
+    max_nfev=50
+):
+    """
+    Bundle Adjustment：优化焦距 f、相机位姿 R,t、三维点 X。
+
+    优化变量：
+        1. 焦距 f
+        2. 除 fixed_image_id 之外的相机位姿 rvec, tvec
+        3. 所有三维点 xyz
+
+    固定变量：
+        1. 主点 cx, cy
+        2. fixed_image_id 的相机位姿
+
+    当前相机模型：
+        SIMPLE_PINHOLE，即 fx = fy = f
+    """
+
+    if fixed_image_id is None:
+        fixed_image_id = min(registered_images)
+
+    image_ids = sorted(list(registered_images))
+    point_ids = list(points3D.keys())
+
+    if len(image_ids) < 5:
+        print("注册图像数量较少，不优化焦距，改用固定 K BA。")
+        camera_poses, points3D = run_bundle_adjustment_fixed_K(
+            camera_poses=camera_poses,
+            points3D=points3D,
+            registered_images=registered_images,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            fixed_image_id=fixed_image_id,
+            max_nfev=max_nfev
+        )
+        return camera_poses, points3D, camera_intrinsics
+
+    if len(point_ids) < 100:
+        print("三维点数量较少，不优化焦距，改用固定 K BA。")
+        camera_poses, points3D = run_bundle_adjustment_fixed_K(
+            camera_poses=camera_poses,
+            points3D=points3D,
+            registered_images=registered_images,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            fixed_image_id=fixed_image_id,
+            max_nfev=max_nfev
+        )
+        return camera_poses, points3D, camera_intrinsics
+
+    variable_image_ids = [
+        image_id for image_id in image_ids
+        if image_id != fixed_image_id
+    ]
+
+    f_init = float(camera_intrinsics["f"])
+    cx = float(camera_intrinsics["cx"])
+    cy = float(camera_intrinsics["cy"])
+
+    width = camera_intrinsics.get("width", None)
+    height = camera_intrinsics.get("height", None)
+
+    if width is not None and height is not None:
+        max_dim = max(width, height)
+        min_f = 0.3 * max_dim
+        max_f = 5.0 * max_dim
+    else:
+        min_f = 0.2 * f_init
+        max_f = 5.0 * f_init
+
+    # -------------------------------
+    # 1. 收集 BA 观测
+    # -------------------------------
+    observations = []
+
+    for point_id in point_ids:
+        point = points3D[point_id]
+
+        for obs in point["observations"]:
+            image_id, kp_id = obs
+
+            if image_id not in registered_images:
+                continue
+
+            x_obs = np.array(
+                all_results[image_id]["keypoints"][kp_id].pt,
+                dtype=np.float64
+            )
+
+            observations.append((image_id, point_id, x_obs))
+
+    if len(observations) < 300:
+        print("BA 观测数量较少，不优化焦距，改用固定 K BA。")
+        camera_poses, points3D = run_bundle_adjustment_fixed_K(
+            camera_poses=camera_poses,
+            points3D=points3D,
+            registered_images=registered_images,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            fixed_image_id=fixed_image_id,
+            max_nfev=max_nfev
+        )
+        return camera_poses, points3D, camera_intrinsics
+
+    # -------------------------------
+    # 2. 打包优化变量
+    # -------------------------------
+    x0_list = []
+
+    # 第一个变量：焦距 f
+    x0_list.append(f_init)
+
+    # 相机位姿变量
+    for image_id in variable_image_ids:
+        R = camera_poses[image_id]["R"]
+        t = camera_poses[image_id]["t"].reshape(3, 1)
+
+        rvec, _ = cv2.Rodrigues(R)
+
+        x0_list.extend(rvec.ravel())
+        x0_list.extend(t.ravel())
+
+    # 三维点变量
+    for point_id in point_ids:
+        X = points3D[point_id]["xyz"]
+        x0_list.extend(X.ravel())
+
+    x0 = np.array(x0_list, dtype=np.float64)
+
+    # -------------------------------
+    # 3. 设置上下界
+    # -------------------------------
+    lower_bounds = []
+    upper_bounds = []
+
+    # 焦距范围
+    lower_bounds.append(min_f)
+    upper_bounds.append(max_f)
+
+    # 相机位姿不限制
+    for _ in variable_image_ids:
+        lower_bounds.extend([-np.inf] * 6)
+        upper_bounds.extend([np.inf] * 6)
+
+    # 三维点不限制
+    for _ in point_ids:
+        lower_bounds.extend([-np.inf] * 3)
+        upper_bounds.extend([np.inf] * 3)
+
+    lower_bounds = np.array(lower_bounds, dtype=np.float64)
+    upper_bounds = np.array(upper_bounds, dtype=np.float64)
+
+    # -------------------------------
+    # 4. 解包函数
+    # -------------------------------
+    def unpack_params(params):
+        offset = 0
+
+        f = params[offset]
+        offset += 1
+
+        poses = {}
+
+        poses[fixed_image_id] = {
+            "R": camera_poses[fixed_image_id]["R"],
+            "t": camera_poses[fixed_image_id]["t"]
+        }
+
+        for image_id in variable_image_ids:
+            rvec = params[offset:offset + 3]
+            offset += 3
+
+            tvec = params[offset:offset + 3].reshape(3, 1)
+            offset += 3
+
+            R, _ = cv2.Rodrigues(rvec)
+
+            poses[image_id] = {
+                "R": R,
+                "t": tvec
+            }
+
+        points = {}
+
+        for point_id in point_ids:
+            X = params[offset:offset + 3]
+            offset += 3
+
+            points[point_id] = X
+
+        return f, poses, points
+
+    # -------------------------------
+    # 5. 残差函数
+    # -------------------------------
+    def residual_function(params):
+        f, poses, points = unpack_params(params)
+
+        residuals = []
+
+        for image_id, point_id, x_obs in observations:
+            R = poses[image_id]["R"]
+            t = poses[image_id]["t"]
+            X = points[point_id]
+
+            x_proj = project_point_with_f(
+                f=f,
+                cx=cx,
+                cy=cy,
+                R=R,
+                t=t,
+                X=X
+            )
+
+            if x_proj is None:
+                residuals.extend([1000.0, 1000.0])
+                continue
+
+            residual = x_proj - x_obs
+            residuals.extend(residual.tolist())
+
+        return np.array(residuals, dtype=np.float64)
+
+    # -------------------------------
+    # 6. 执行优化
+    # -------------------------------
+    result = least_squares(
+        residual_function,
+        x0,
+        bounds=(lower_bounds, upper_bounds),
+        loss="huber",
+        f_scale=3.0,
+        max_nfev=max_nfev,
+        verbose=0
+    )
+
+    f_opt, optimized_poses, optimized_points = unpack_params(result.x)
+
+    # -------------------------------
+    # 7. 写回结果
+    # -------------------------------
+    camera_intrinsics["f"] = float(f_opt)
+
+    for image_id in optimized_poses:
+        camera_poses[image_id]["R"] = optimized_poses[image_id]["R"]
+        camera_poses[image_id]["t"] = optimized_poses[image_id]["t"]
+
+    for point_id in optimized_points:
+        points3D[point_id]["xyz"] = optimized_points[point_id]
+
+    print(
+        f"BA refine focal 完成："
+        f"cost={result.cost:.4f}, "
+        f"f: {f_init:.2f} -> {f_opt:.2f}, "
+        f"observations={len(observations)}, "
+        f"cameras={len(registered_images)}, "
+        f"points={len(points3D)}"
+    )
+
+    return camera_poses, points3D, camera_intrinsics
+
+def run_sfm_bundle_adjustment(
+    camera_poses,
+    points3D,
+    registered_images,
+    all_results,
+    camera_intrinsics,
+    fixed_image_id=None,
+    refine_focal_min_images=5,
+    refine_focal_min_points=150,
+    refine_focal_min_observations=500,
+    fixed_K_max_nfev=30,
+    refine_focal_max_nfev=50
+):
+    """
+    SfM 中的 BA 调度函数。
+
+    根据当前重建状态自动选择：
+        1. 固定 K 的 BA
+        2. 优化焦距 f 的 BA
+
+    返回：
+        camera_poses
+        points3D
+        camera_intrinsics
+    """
+
+    if fixed_image_id is None:
+        fixed_image_id = min(registered_images)
+
+    # 统计当前观测数量
+    num_observations = 0
+
+    for point_id, point in points3D.items():
+        for obs in point["observations"]:
+            image_id, kp_id = obs
+
+            if image_id in registered_images:
+                num_observations += 1
+
+    num_registered_images = len(registered_images)
+    num_points = len(points3D)
+
+    print(
+        f"BA 调度："
+        f"images={num_registered_images}, "
+        f"points={num_points}, "
+        f"observations={num_observations}, "
+        f"current_f={camera_intrinsics['f']:.3f}"
+    )
+
+    can_refine_focal = (
+        num_registered_images >= refine_focal_min_images
+        and num_points >= refine_focal_min_points
+        and num_observations >= refine_focal_min_observations
+        and camera_intrinsics.get("refine_focal_length", True)
+    )
+
+    if can_refine_focal:
+        print("执行 BA：优化焦距 f + 相机位姿 R,t + 三维点 X")
+
+        camera_poses, points3D, camera_intrinsics = run_bundle_adjustment_refine_focal(
+            camera_poses=camera_poses,
+            points3D=points3D,
+            registered_images=registered_images,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            fixed_image_id=fixed_image_id,
+            max_nfev=refine_focal_max_nfev
+        )
+
+    else:
+        print("执行 BA：固定 K，只优化相机位姿 R,t + 三维点 X")
+
+        camera_poses, points3D = run_bundle_adjustment_fixed_K(
+            camera_poses=camera_poses,
+            points3D=points3D,
+            registered_images=registered_images,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            fixed_image_id=fixed_image_id,
+            max_nfev=fixed_K_max_nfev
+        )
+
+    return camera_poses, points3D, camera_intrinsics
+
+def incremental_sfm_expansion(
+    pair_infos,
+    valid_tracks,
+    observation_to_track,
+    camera_poses,
+    registered_images,
+    points3D,
+    track_to_point3D,
+    point3D_to_track,
+    all_results,
+    camera_intrinsics,
+    min_common_points=20,
+    min_pnp_points=20,
+    ba_every_iteration=True,
+    global_ba_every=5
+):
+    """
+    增量式 SfM 扩展。
+
+    按照你的流程：
+
+        while G 中还有边：
+            1. 从 G 中选取边 e，使 track(e) 与已重建 3D 点交集最大
+            2. 用 PnP 方法估计新图像相机位姿
+            3. 三角化新的 tracks
+            4. 删除 G 中的边 e
+            5. 执行 Bundle Adjustment
+
+    BA 策略：
+        前期固定 K，只优化 R,t,X；
+        后期优化焦距 f，同时优化 R,t,X。
+    """
+
+    remaining_edges = dict(pair_infos)
+
+    iteration = 0
+
+    while len(remaining_edges) > 0:
+        registered_images = set(camera_poses.keys())
+        iteration += 1
+
+        print(f"\n========== SfM 增量迭代 {iteration} ==========")
+        print(f"剩余边数量：{len(remaining_edges)}")
+        print(f"已注册图像数量：{len(registered_images)}")
+        print(f"当前三维点数量：{len(points3D)}")
+        print(f"当前焦距 f：{camera_intrinsics['f']:.3f}")
+
+        # ------------------------------------------------
+        # 1. 从 G 中选取边 e
+        # ------------------------------------------------
+        pair, new_image_id, registered_image_id, score = select_next_edge_for_pnp(
+            pair_infos=remaining_edges,
+            registered_images=registered_images,
+            track_to_point3D=track_to_point3D,
+            observation_to_track=observation_to_track,
+            min_common_points=min_common_points
+        )
+
+        if pair is None:
+            print("没有更多满足 PnP 条件的边，增量 SfM 结束。")
+            break
+
+        print(
+            f"选择边 e={pair}, "
+            f"已注册图像={registered_image_id}, "
+            f"新图像={new_image_id}, "
+            f"可用 3D-2D 数量={score}"
+        )
+
+        pair_info = remaining_edges[pair]
+
+        # ------------------------------------------------
+        # 2. 用 PnP 方法估计新图像位姿
+        # ------------------------------------------------
+        success, R, t, pnp_inlier_track_ids, pnp_info = register_image_by_pnp(
+            pair=pair,
+            pair_info=pair_info,
+            new_image_id=new_image_id,
+            observation_to_track=observation_to_track,
+            track_to_point3D=track_to_point3D,
+            points3D=points3D,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            min_pnp_points=min_pnp_points
+        )
+
+        if not success:
+            print(f"PnP 注册失败：{pnp_info}")
+
+            # 按你的流程，失败边也从 G 中删除
+            del remaining_edges[pair]
+            print(f"删除失败边 e={pair}")
+
+            continue
+
+        camera_poses[new_image_id] = {
+            "R": R,
+            "t": t
+        }
+
+        registered_images.add(new_image_id)
+
+        print(
+            f"PnP 注册成功：image={new_image_id}, "
+            f"PnP inliers={pnp_info['num_pnp_inliers']}"
+        )
+
+        # ------------------------------------------------
+        # 3. 三角化新的 tracks
+        # ------------------------------------------------
+        new_points_count = triangulate_new_tracks_after_registering_image(
+            new_image_id=new_image_id,
+            pair_infos=remaining_edges,
+            valid_tracks=valid_tracks,
+            observation_to_track=observation_to_track,
+            track_to_point3D=track_to_point3D,
+            point3D_to_track=point3D_to_track,
+            points3D=points3D,
+            camera_poses=camera_poses,
+            registered_images=registered_images,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            reproj_error_threshold=5.0
+        )
+
+        print(f"新增三角化点数量：{new_points_count}")
+
+        # ------------------------------------------------
+        # 4. 删除 G 中的边 e
+        # ------------------------------------------------
+        del remaining_edges[pair]
+        print(f"删除已处理边 e={pair}")
+
+        # ------------------------------------------------
+        # 5. 每轮 BA
+        # ------------------------------------------------
+        if ba_every_iteration:
+            camera_poses, points3D, camera_intrinsics = run_sfm_bundle_adjustment(
+                camera_poses=camera_poses,
+                points3D=points3D,
+                registered_images=registered_images,
+                all_results=all_results,
+                camera_intrinsics=camera_intrinsics,
+                fixed_image_id=min(registered_images),
+                refine_focal_min_images=5,
+                refine_focal_min_points=150,
+                refine_focal_min_observations=500,
+                fixed_K_max_nfev=3,
+                refine_focal_max_nfev=3
+            )
+
+            print(f"每轮 BA 后焦距 f：{camera_intrinsics['f']:.3f}")
+
+        # ------------------------------------------------
+        # 6. 周期性全局 BA
+        # ------------------------------------------------
+        if global_ba_every is not None and iteration % global_ba_every == 0:
+            print("执行周期性全局 BA")
+
+            camera_poses, points3D, camera_intrinsics = run_sfm_bundle_adjustment(
+                camera_poses=camera_poses,
+                points3D=points3D,
+                registered_images=registered_images,
+                all_results=all_results,
+                camera_intrinsics=camera_intrinsics,
+                fixed_image_id=min(registered_images),
+                refine_focal_min_images=5,
+                refine_focal_min_points=150,
+                refine_focal_min_observations=500,
+                fixed_K_max_nfev=3,
+                refine_focal_max_nfev=3
+            )
+
+            print(f"周期性 BA 后焦距 f：{camera_intrinsics['f']:.3f}")
+
+    # ------------------------------------------------
+    # 7. 最终全局 BA
+    # ------------------------------------------------
+    if len(registered_images) >= 2 and len(points3D) >= 10:
+        print("\n执行最终全局 BA")
+
+        camera_poses, points3D, camera_intrinsics = run_sfm_bundle_adjustment(
+            camera_poses=camera_poses,
+            points3D=points3D,
+            registered_images=registered_images,
+            all_results=all_results,
+            camera_intrinsics=camera_intrinsics,
+            fixed_image_id=min(registered_images),
+            refine_focal_min_images=5,
+            refine_focal_min_points=150,
+            refine_focal_min_observations=500,
+            fixed_K_max_nfev=3,
+            refine_focal_max_nfev=3
+        )
+
+    print("\n========== 增量 SfM 结束 ==========")
+    print(f"最终注册图像数量：{len(registered_images)}")
+    print(f"最终三维点数量：{len(points3D)}")
+    print(f"最终焦距 f：{camera_intrinsics['f']:.3f}")
+
+    return (
+        camera_poses,
+        registered_images,
+        points3D,
+        track_to_point3D,
+        point3D_to_track,
+        camera_intrinsics
+    )
+
+def get_point_color_from_observations(point_info, all_results):
+    """
+    根据三维点的 observations 从图像中取颜色。
+
+    使用该点第一个有效观测位置的像素颜色。
+    OpenCV 图像格式是 BGR，这里转换为 RGB。
+    """
+
+    observations = point_info.get("observations", [])
+
+    for image_id, kp_id in observations:
+        if image_id < 0 or image_id >= len(all_results):
+            continue
+
+        image = all_results[image_id]["image"]
+        keypoints = all_results[image_id]["keypoints"]
+
+        if kp_id < 0 or kp_id >= len(keypoints):
+            continue
+
+        h, w = image.shape[:2]
+
+        x, y = keypoints[kp_id].pt
+        x = int(round(x))
+        y = int(round(y))
+
+        if 0 <= x < w and 0 <= y < h:
+            b, g, r = image[y, x]
+            return int(r), int(g), int(b)
+
+    return 255, 255, 255
+
+def save_colored_points3D_to_ply(points3D, all_results, save_path):
+    """
+    将 points3D 保存为带颜色的 PLY 点云。
+    """
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    valid_points = []
+
+    for point_id, point_info in points3D.items():
+        X = np.asarray(point_info["xyz"], dtype=np.float64).reshape(3)
+
+        if not np.isfinite(X).all():
+            continue
+
+        r, g, b = get_point_color_from_observations(
+            point_info=point_info,
+            all_results=all_results
+        )
+
+        valid_points.append((X[0], X[1], X[2], r, g, b))
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(valid_points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        for x, y, z, r, g, b in valid_points:
+            f.write(
+                f"{x:.6f} {y:.6f} {z:.6f} "
+                f"{int(r)} {int(g)} {int(b)}\n"
+            )
+
+    print(f"彩色三维点云已保存：{save_path}")
+    print(f"有效三维点数量：{len(valid_points)}")
+
 def main():
     # 先设置输入输出路径，并创建相应的文件夹
     image_folder = "image"
@@ -807,6 +2158,48 @@ def main():
         point_id += 1
 
     print(f"初始三维点数量：{len(points3D)}")
+
+    camera_intrinsics = {
+        "model": "SIMPLE_PINHOLE",
+        "width": all_results[init_i]["image"].shape[1],
+        "height": all_results[init_i]["image"].shape[0],
+        "f": float(K_init[0, 0]),
+        "cx": float(K_init[0, 2]),
+        "cy": float(K_init[1, 2]),
+        "refine_focal_length": True,
+        "refine_principal_point": False,
+        "refine_extra_params": False
+    }
+
+    (
+        camera_poses,
+        registered_images,
+        points3D,
+        track_to_point3D,
+        point3D_to_track,
+        camera_intrinsics
+    ) = incremental_sfm_expansion(
+        pair_infos=pair_infos,
+        valid_tracks=valid_tracks,
+        observation_to_track=observation_to_track,
+        camera_poses=camera_poses,
+        registered_images=registered_images,
+        points3D=points3D,
+        track_to_point3D=track_to_point3D,
+        point3D_to_track=point3D_to_track,
+        all_results=all_results,
+        camera_intrinsics=camera_intrinsics,
+        min_common_points=20,
+        min_pnp_points=20,
+        ba_every_iteration=True,
+        global_ba_every=5
+    )
+
+    save_colored_points3D_to_ply(
+        points3D=points3D,
+        all_results=all_results,
+        save_path=Path(output_folder) / "sparse_points_colored.ply"
+    )
 
     print("\n全部处理完成。")
 

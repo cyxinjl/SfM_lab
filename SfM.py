@@ -1,8 +1,6 @@
 import cv2
 import numpy as np
-import math
 from pathlib import Path
-import random
 from collections import defaultdict
 from scipy.optimize import least_squares
 
@@ -80,159 +78,52 @@ def from_homogeneous(points_h, eps=1e-8): # 将齐次坐标转化为欧式坐标
     else:
         raise ValueError("输入只能是一维或二维 numpy 数组。")
 
-def compute_sampson_errors(pts1, pts2, F): # 计算匹配点相对于基础矩阵 F 的误差距离。
-    # pst1表示第一张图的匹配点坐标，pts2表示第二张图的匹配点坐标
-    pts1 = np.asarray(pts1, dtype=np.float64) 
-    pts2 = np.asarray(pts2, dtype=np.float64)
-    pts1_h = to_homogeneous(pts1) # 将匹配点坐标转换为齐次坐标
-    pts2_h = to_homogeneous(pts2) 
-    F = np.asarray(F, dtype=np.float64)
-    num_points = pts1.shape[0] #匹配点的数量
-    
-    F_pts1 = F @ pts1_h.T # F x1
-    Ft_pts2 = F.T @ pts2_h.T # F^T x2
-    numerator = np.sum(pts2_h * (F @ pts1_h.T).T, axis=1) ** 2 # (x2^T F x1)^2，表示匹配点在基础矩阵 F 上的残差平方
-    denominator = (F_pts1[0, :] ** 2 + F_pts1[1, :] ** 2 + Ft_pts2[0, :] ** 2 + Ft_pts2[1, :] ** 2 ) #用在分母上进行归一化处理，得到真正的像素几何
-    eps = 1e-12 #为了避免除以零的情况，
-    errors = numerator / (denominator + eps) 
-    return errors
-
-def compute_ransac_iterations(inlier_ratio, sample_size, confidence, max_iterations): # 根据当前内点比例，自适应计算 RANSAC 所需迭代次数。
-    """参数注释：
-    inlier_ratio:当前最佳模型的内点比例。
-    sample_size:每次估计模型需要采样的点数，在这里基础矩阵八点法中值的大小为8。
-    confidence:希望至少采到一次全内点样本的概率。
-    max_iterations:当前最大允许迭代次数，要在这个基础上迭代优化。
-    
-    iterations:根据当前内点比例估计出的迭代次数。
+def estimate_fundamental_matrix_opencv_ransac(kp1, kp2, matches, ransac_threshold=3.0, confidence=0.99, max_iters=50000):
     """
-    if inlier_ratio <= 0:
-        return max_iterations
-    if inlier_ratio >= 1:
-        return 1
+    使用 OpenCV 自带 RANSAC 估计基础矩阵 F，并筛选几何内点。
 
-    prob_all_inliers = inlier_ratio ** sample_size # 一次采样中所有 sample_size 个点都是内点的概率
-    eps = 1e-12 # 防止 log(0) 和 log(1) 的情况。
-    prob_all_inliers = min(max(prob_all_inliers, eps), 1.0 - eps)
-
-    numerator = math.log(1.0 - confidence)
-    denominator = math.log(1.0 - prob_all_inliers)
-    iterations = int(math.ceil(numerator / denominator))
-    iterations = max(1, min(iterations, max_iterations))
-    return iterations
-
-def estimate_fundamental_matrix(kp1, kp2, matches, threshold=1.0, confidence=0.99, initial_max_iterations=50000, min_iterations=100): # RANSAC 算法主函数
-    """
     参数：
-    kp1:第一张图像的 OpenCV keypoints 列表。
-    kp2:第二张图像的 OpenCV keypoints 列表。
-    matches:两张图像之间的匹配点列表，元素类型为 cv2.DMatch。
-    threshold:Sampson distance 内点判断阈值。
-    confidence:RANSAC 置信度。
-    initial_max_iterations:初始最大迭代次数。
-    min_iterations:最少迭代次数，避免过早停止。
-    sample_size:每次采样点数，在这里八点法估计基础矩阵时为 8。
+    kp1:第一张图像的 OpenCV keypoints。
+    kp2:第二张图像的 OpenCV keypoints。
+    matches:两张图像之间的匹配结果，元素类型为 cv2.DMatch。
+    ransac_threshold: RANSAC 内点判断阈值，单位近似为像素。
+    confidence: RANSAC 置信度。
+    max_iters:最大迭代次数。
 
-    返回参数：
-    best_F:估计得到的基础矩阵 F,形状 3*3。
-    inlier_matches: RANSAC 内点匹配。
-    inlier_mask:与 matches 等长的一维数组。1 表示内点,0 表示外点。
-    info:字典，包含迭代次数、内点数量、内点比例等信息。
+    返回：
+    F:基础矩阵，3×3。
+    inlier_matches:通过 RANSAC 几何验证的匹配点。
+    mask:与 matches 等长的一维数组。1 表示内点，0 表示外点。
     """
-    sample_size = 8  # 八点法需要采样的点数
-    if matches is None or len(matches) < sample_size:
-        info = {
-            "success": False,
-            "reason": "匹配点数量少于八点法所需的最小点数",
-            "iterations_used": 0,
-            "best_score": 0,
-            "inlier_ratio": 0.0
-        }
-        return None, [], None, info
+    if matches is None or len(matches) < 8:
+        return None, [], None
 
-    pts1 = np.float64([kp1[m.queryIdx].pt for m in matches]) # 从匹配点列表中提取匹配点坐标，转换为浮点数数组
-    pts2 = np.float64([kp2[m.trainIdx].pt for m in matches])
-    num_matches = len(matches)
-    best_F = None
-    best_mask = None # 用于标记内点的布尔数组，长度与 matches 相同，True 表示内点，False 表示外点
-    best_score = 0 # 当前最佳模型的内点数量
-    best_inlier_ratio = 0.0 # 当前最佳模型的内点比例
-    max_iterations = initial_max_iterations # 当前允许的最大迭代次数，会在循环中动态更新
-    iteration = 0
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+    if pts1.shape[0] < 8 or pts2.shape[0] < 8:
+        return None, [], None
+    try:
+        F, mask = cv2.findFundamentalMat(
+            pts1,
+            pts2,
+            method=cv2.FM_RANSAC,
+            ransacReprojThreshold=ransac_threshold,
+            confidence=confidence,
+            maxIters=max_iters)
+    except cv2.error as e:
+        print("cv2.findFundamentalMat 出错：")
+        print(e)
+        return None, [], None
 
-    while iteration < max_iterations: # RANSAC 主循环，直到达到最大迭代次数
-        iteration += 1
-        sample_indices = random.sample(range(num_matches), sample_size) # 从所有匹配点中随机选择 8 对点
-        sample_pts1 = pts1[sample_indices]
-        sample_pts2 = pts2[sample_indices]
+    if F is None or mask is None:
+        return None, [], None
+    if F.shape != (3, 3):
+        return None, [], None
 
-        F_candidate, _ = cv2.findFundamentalMat(sample_pts1, sample_pts2, method=cv2.FM_8POINT) # 使用8点法估计F
+    mask = mask.ravel().astype(np.uint8)
+    inlier_matches = [m for m, keep in zip(matches, mask) if keep == 1]
 
-        if F_candidate is None:
-            continue
-        if F_candidate.shape != (3, 3):
-            continue
-        if not np.isfinite(F_candidate).all(): # 如果 F 中存在 NaN 或 Inf，说明估计失败，跳过本次迭代
-            continue
-
-        errors = compute_sampson_errors(pts1, pts2, F_candidate) # 根据 Sampson distance 判断哪些匹配点是内点
-        current_mask = errors < threshold
-        current_score = int(np.sum(current_mask))
-        current_inlier_ratio = current_score / num_matches
-
-        
-        if current_score > best_score: # d) 如果当前模型更好，则更新迭代次数
-            best_score = current_score
-            best_F = F_candidate
-            best_mask = current_mask
-            best_inlier_ratio = current_inlier_ratio
-
-            # 根据当前最佳内点比例，重新计算所需迭代次数
-            estimated_iterations = compute_ransac_iterations(
-                inlier_ratio=best_inlier_ratio,
-                sample_size=sample_size,
-                confidence=confidence,
-                max_iterations=max_iterations
-            )
-            max_iterations = max(min_iterations, estimated_iterations) # 不能低于最小迭代次数
-
-    if best_F is None or best_mask is None:
-        info = {
-            "success": False,
-            "reason": "没有找到有效的基础矩阵",
-            "iterations_used": iteration,
-            "best_score": 0,
-            "inlier_ratio": 0.0,
-            "adaptive_max_iterations": max_iterations
-        }
-        return None, [], None, info
-
-    inlier_pts1 = pts1[best_mask]
-    inlier_pts2 = pts2[best_mask]
-
-    if len(inlier_pts1) >= sample_size:
-        refined_F, _ = cv2.findFundamentalMat(inlier_pts1, inlier_pts2, method=cv2.FM_8POINT)
-        if refined_F is not None and refined_F.shape == (3, 3):
-            if np.isfinite(refined_F).all():
-                best_F = refined_F
-                errors = compute_sampson_errors(pts1, pts2, best_F)
-                best_mask = errors < threshold
-                best_score = int(np.sum(best_mask))
-                best_inlier_ratio = best_score / num_matches
-    inlier_mask = best_mask.astype(np.uint8) # 将布尔数组转换为 uint8 类型，1 表示内点，0 表示外点
-
-    inlier_matches = [m for m, keep in zip(matches, inlier_mask) if keep == 1] # 根据内点掩码过滤出内点匹配列表
-
-    info = {
-        "success": True,
-        "iterations_used": iteration,
-        "best_score": best_score,
-        "inlier_ratio": best_inlier_ratio,
-        "total_matches": num_matches,
-        "threshold": threshold,
-    }
-
-    return best_F, inlier_matches, inlier_mask, info
+    return F, inlier_matches, mask
 
 class UnionFind: # 用于后续步骤中对匹配点进行 Tracks 构建。
     def __init__(self):
@@ -488,7 +379,7 @@ def evaluate_initial_pair(
     pair,
     pair_info,
     all_results,
-    min_pose_inliers=30,
+    min_pose_inliers=20,
     min_triangulated_points=30,
     min_angle_deg=3.0,
     max_angle_deg=70.0,
@@ -608,7 +499,7 @@ def evaluate_initial_pair(
 def select_initial_pair(
     pair_infos,
     all_results,
-    min_pose_inliers=30,
+    min_pose_inliers=20,
     min_triangulated_points=30,
     min_angle_deg=3.0,
     max_angle_deg=70.0,
@@ -647,7 +538,7 @@ def select_next_edge_for_pnp(
     registered_images,
     track_to_point3D,
     observation_to_track,
-    min_common_points=20
+    min_common_points=15
 ):
     """
     从 G 中选择下一条用于 PnP 的边 e。
@@ -788,7 +679,7 @@ def register_image_by_pnp(
     points3D,
     all_results,
     camera_intrinsics,
-    min_pnp_points=20,
+    min_pnp_points=15,
     reprojection_error=8.0,
     confidence=0.99,
     iterations_count=1000
@@ -864,21 +755,6 @@ def register_image_by_pnp(
         "num_pnp_inliers": len(inliers)
     }
 
-def from_homogeneous(points_h, eps=1e-8):
-    points_h = np.asarray(points_h, dtype=np.float64)
-    w = points_h[:, -1]
-
-    points = np.full(
-        (points_h.shape[0], points_h.shape[1] - 1),
-        np.nan,
-        dtype=np.float64
-    )
-
-    valid = np.abs(w) > eps
-    points[valid] = points_h[valid, :-1] / w[valid, None]
-
-    return points
-
 def project_point(K, R, t, X):
     X = X.reshape(3, 1)
     x = K @ (R @ X + t.reshape(3, 1))
@@ -893,7 +769,7 @@ def is_triangulated_point_valid(
     all_results,
     camera_poses,
     camera_intrinsics,
-    reproj_error_threshold=5.0
+    reproj_error_threshold=8.0
 ):
     """
     检查三角化点是否有效。
@@ -1017,7 +893,7 @@ def triangulate_new_tracks_after_registering_image(
     registered_images,
     all_results,
     camera_intrinsics,
-    reproj_error_threshold=5.0
+    reproj_error_threshold=8.0
 ):
     """
     新图像注册成功后，三角化新的 tracks。
@@ -1137,7 +1013,8 @@ def run_bundle_adjustment_fixed_K(
     all_results,
     camera_intrinsics,
     fixed_image_id=None,
-    max_nfev=50
+    max_nfev=50,
+    max_optimized_points=300
 ):
     """
     简化版 Bundle Adjustment。
@@ -1150,9 +1027,8 @@ def run_bundle_adjustment_fixed_K(
         1. 相机内参 K
         2. fixed_image_id 对应的相机位姿，用于固定坐标系尺度和规范自由度
 
-    注意：
-        这是教学版 BA，适合你当前程序接入。
-        后续可以扩展为优化 K 的 BA。
+    为避免个人电脑上有限差分雅可比计算量过大，超过 max_optimized_points
+    的三维点会被随机下采样。
     """
 
     if fixed_image_id is None:
@@ -1160,8 +1036,15 @@ def run_bundle_adjustment_fixed_K(
 
     K = build_K_from_intrinsics(camera_intrinsics)
 
-    # 只优化有足够观测的点
-    point_ids = list(points3D.keys())
+    # 随机下采样三维点，控制优化变量数量
+    all_point_ids = list(points3D.keys())
+    if len(all_point_ids) > max_optimized_points:
+        rng = np.random.default_rng(42)
+        point_ids = rng.choice(all_point_ids, max_optimized_points, replace=False).tolist()
+        print(f"BA 点采样：{len(all_point_ids)} -> {len(point_ids)}")
+    else:
+        point_ids = all_point_ids
+
     image_ids = sorted(list(registered_images))
 
     variable_image_ids = [
@@ -1169,15 +1052,7 @@ def run_bundle_adjustment_fixed_K(
         if image_id != fixed_image_id
     ]
 
-    image_id_to_var_idx = {
-        image_id: idx for idx, image_id in enumerate(variable_image_ids)
-    }
-
-    point_id_to_var_idx = {
-        point_id: idx for idx, point_id in enumerate(point_ids)
-    }
-
-    # 收集 BA 观测
+    # 只收集被采样点的观测
     observations = []
 
     for point_id in point_ids:
@@ -1195,9 +1070,14 @@ def run_bundle_adjustment_fixed_K(
 
             observations.append((image_id, point_id, x_obs))
 
+    n_params = len(variable_image_ids) * 6 + len(point_ids) * 3
+
     if len(observations) < 10:
         print("BA 观测数量太少，跳过。")
         return camera_poses, points3D
+
+    print(f"BA 参数：cameras={len(variable_image_ids)}, points={len(point_ids)}, "
+          f"params={n_params}, observations={len(observations)}, max_nfev={max_nfev}")
 
     # 打包优化变量
     x0_list = []
@@ -1217,21 +1097,16 @@ def run_bundle_adjustment_fixed_K(
 
     x0 = np.array(x0_list, dtype=np.float64)
 
-    num_cameras = len(variable_image_ids)
-    num_points = len(point_ids)
-
     def unpack_params(params):
         poses = {}
 
         offset = 0
 
-        # 固定相机
         poses[fixed_image_id] = {
             "R": camera_poses[fixed_image_id]["R"],
             "t": camera_poses[fixed_image_id]["t"]
         }
 
-        # 可变相机
         for image_id in variable_image_ids:
             rvec = params[offset:offset + 3]
             offset += 3
@@ -1246,7 +1121,6 @@ def run_bundle_adjustment_fixed_K(
                 "t": tvec
             }
 
-        # 三维点
         points = {}
 
         for point_id in point_ids:
@@ -1284,7 +1158,7 @@ def run_bundle_adjustment_fixed_K(
         loss="huber",
         f_scale=3.0,
         max_nfev=max_nfev,
-        verbose=0
+        verbose=2
     )
 
     optimized_poses, optimized_points = unpack_params(result.x)
@@ -1294,7 +1168,7 @@ def run_bundle_adjustment_fixed_K(
         camera_poses[image_id]["R"] = optimized_poses[image_id]["R"]
         camera_poses[image_id]["t"] = optimized_poses[image_id]["t"]
 
-    # 写回 points3D
+    # 写回 points3D（只写回被优化的点）
     for point_id in optimized_points:
         points3D[point_id]["xyz"] = optimized_points[point_id]
 
@@ -1344,7 +1218,8 @@ def run_bundle_adjustment_refine_focal(
     all_results,
     camera_intrinsics,
     fixed_image_id=None,
-    max_nfev=50
+    max_nfev=50,
+    max_optimized_points=300
 ):
     """
     Bundle Adjustment：优化焦距 f、相机位姿 R,t、三维点 X。
@@ -1352,21 +1227,20 @@ def run_bundle_adjustment_refine_focal(
     优化变量：
         1. 焦距 f
         2. 除 fixed_image_id 之外的相机位姿 rvec, tvec
-        3. 所有三维点 xyz
+        3. 三维点 xyz
 
     固定变量：
         1. 主点 cx, cy
         2. fixed_image_id 的相机位姿
 
-    当前相机模型：
-        SIMPLE_PINHOLE，即 fx = fy = f
+    为避免个人电脑上有限差分雅可比计算量过大，超过 max_optimized_points
+    的三维点会被随机下采样。
     """
 
     if fixed_image_id is None:
         fixed_image_id = min(registered_images)
 
     image_ids = sorted(list(registered_images))
-    point_ids = list(points3D.keys())
 
     if len(image_ids) < 5:
         print("注册图像数量较少，不优化焦距，改用固定 K BA。")
@@ -1377,9 +1251,19 @@ def run_bundle_adjustment_refine_focal(
             all_results=all_results,
             camera_intrinsics=camera_intrinsics,
             fixed_image_id=fixed_image_id,
-            max_nfev=max_nfev
+            max_nfev=max_nfev,
+            max_optimized_points=max_optimized_points
         )
         return camera_poses, points3D, camera_intrinsics
+
+    # 随机下采样三维点
+    all_point_ids = list(points3D.keys())
+    if len(all_point_ids) > max_optimized_points:
+        rng = np.random.default_rng(42)
+        point_ids = rng.choice(all_point_ids, max_optimized_points, replace=False).tolist()
+        print(f"BA 点采样：{len(all_point_ids)} -> {len(point_ids)}")
+    else:
+        point_ids = all_point_ids
 
     if len(point_ids) < 100:
         print("三维点数量较少，不优化焦距，改用固定 K BA。")
@@ -1390,7 +1274,8 @@ def run_bundle_adjustment_refine_focal(
             all_results=all_results,
             camera_intrinsics=camera_intrinsics,
             fixed_image_id=fixed_image_id,
-            max_nfev=max_nfev
+            max_nfev=max_nfev,
+            max_optimized_points=max_optimized_points
         )
         return camera_poses, points3D, camera_intrinsics
 
@@ -1414,9 +1299,7 @@ def run_bundle_adjustment_refine_focal(
         min_f = 0.2 * f_init
         max_f = 5.0 * f_init
 
-    # -------------------------------
-    # 1. 收集 BA 观测
-    # -------------------------------
+    # 1. 收集 BA 观测（只收集被采样点的观测）
     observations = []
 
     for point_id in point_ids:
@@ -1435,6 +1318,8 @@ def run_bundle_adjustment_refine_focal(
 
             observations.append((image_id, point_id, x_obs))
 
+    n_params = 1 + len(variable_image_ids) * 6 + len(point_ids) * 3
+
     if len(observations) < 300:
         print("BA 观测数量较少，不优化焦距，改用固定 K BA。")
         camera_poses, points3D = run_bundle_adjustment_fixed_K(
@@ -1444,19 +1329,19 @@ def run_bundle_adjustment_refine_focal(
             all_results=all_results,
             camera_intrinsics=camera_intrinsics,
             fixed_image_id=fixed_image_id,
-            max_nfev=max_nfev
+            max_nfev=max_nfev,
+            max_optimized_points=max_optimized_points
         )
         return camera_poses, points3D, camera_intrinsics
 
-    # -------------------------------
+    print(f"BA refine focal 参数：cameras={len(variable_image_ids)}, points={len(point_ids)}, "
+          f"params={n_params}, observations={len(observations)}, max_nfev={max_nfev}")
+
     # 2. 打包优化变量
-    # -------------------------------
     x0_list = []
 
-    # 第一个变量：焦距 f
     x0_list.append(f_init)
 
-    # 相机位姿变量
     for image_id in variable_image_ids:
         R = camera_poses[image_id]["R"]
         t = camera_poses[image_id]["t"].reshape(3, 1)
@@ -1466,29 +1351,23 @@ def run_bundle_adjustment_refine_focal(
         x0_list.extend(rvec.ravel())
         x0_list.extend(t.ravel())
 
-    # 三维点变量
     for point_id in point_ids:
         X = points3D[point_id]["xyz"]
         x0_list.extend(X.ravel())
 
     x0 = np.array(x0_list, dtype=np.float64)
 
-    # -------------------------------
     # 3. 设置上下界
-    # -------------------------------
     lower_bounds = []
     upper_bounds = []
 
-    # 焦距范围
     lower_bounds.append(min_f)
     upper_bounds.append(max_f)
 
-    # 相机位姿不限制
     for _ in variable_image_ids:
         lower_bounds.extend([-np.inf] * 6)
         upper_bounds.extend([np.inf] * 6)
 
-    # 三维点不限制
     for _ in point_ids:
         lower_bounds.extend([-np.inf] * 3)
         upper_bounds.extend([np.inf] * 3)
@@ -1496,9 +1375,7 @@ def run_bundle_adjustment_refine_focal(
     lower_bounds = np.array(lower_bounds, dtype=np.float64)
     upper_bounds = np.array(upper_bounds, dtype=np.float64)
 
-    # -------------------------------
     # 4. 解包函数
-    # -------------------------------
     def unpack_params(params):
         offset = 0
 
@@ -1536,9 +1413,7 @@ def run_bundle_adjustment_refine_focal(
 
         return f, poses, points
 
-    # -------------------------------
     # 5. 残差函数
-    # -------------------------------
     def residual_function(params):
         f, poses, points = unpack_params(params)
 
@@ -1567,9 +1442,7 @@ def run_bundle_adjustment_refine_focal(
 
         return np.array(residuals, dtype=np.float64)
 
-    # -------------------------------
     # 6. 执行优化
-    # -------------------------------
     result = least_squares(
         residual_function,
         x0,
@@ -1577,14 +1450,12 @@ def run_bundle_adjustment_refine_focal(
         loss="huber",
         f_scale=3.0,
         max_nfev=max_nfev,
-        verbose=0
+        verbose=2
     )
 
     f_opt, optimized_poses, optimized_points = unpack_params(result.x)
 
-    # -------------------------------
     # 7. 写回结果
-    # -------------------------------
     camera_intrinsics["f"] = float(f_opt)
 
     for image_id in optimized_poses:
@@ -1701,8 +1572,8 @@ def incremental_sfm_expansion(
     point3D_to_track,
     all_results,
     camera_intrinsics,
-    min_common_points=20,
-    min_pnp_points=20,
+    min_common_points=15,
+    min_pnp_points=15,
     ba_every_iteration=True,
     global_ba_every=5
 ):
@@ -1719,8 +1590,9 @@ def incremental_sfm_expansion(
             5. 执行 Bundle Adjustment
 
     BA 策略：
-        前期固定 K，只优化 R,t,X；
-        后期优化焦距 f，同时优化 R,t,X。
+        每轮轻量 BA (max_nfev=10)，维持结构、快速微调；
+        每 global_ba_every 轮做中等 BA (max_nfev=30)；
+        最终全局 BA (max_nfev=100) 充分优化。
     """
 
     remaining_edges = dict(pair_infos)
@@ -1812,7 +1684,7 @@ def incremental_sfm_expansion(
             registered_images=registered_images,
             all_results=all_results,
             camera_intrinsics=camera_intrinsics,
-            reproj_error_threshold=5.0
+            reproj_error_threshold=8.0
         )
 
         print(f"新增三角化点数量：{new_points_count}")
@@ -1824,7 +1696,7 @@ def incremental_sfm_expansion(
         print(f"删除已处理边 e={pair}")
 
         # ------------------------------------------------
-        # 5. 每轮 BA
+        # 5. 每轮轻量 BA
         # ------------------------------------------------
         if ba_every_iteration:
             camera_poses, points3D, camera_intrinsics = run_sfm_bundle_adjustment(
@@ -1837,17 +1709,17 @@ def incremental_sfm_expansion(
                 refine_focal_min_images=5,
                 refine_focal_min_points=150,
                 refine_focal_min_observations=500,
-                fixed_K_max_nfev=3,
-                refine_focal_max_nfev=3
+                fixed_K_max_nfev=10,
+                refine_focal_max_nfev=10
             )
 
-            print(f"每轮 BA 后焦距 f：{camera_intrinsics['f']:.3f}")
+            print(f"每轮轻量 BA 后焦距 f：{camera_intrinsics['f']:.3f}")
 
         # ------------------------------------------------
-        # 6. 周期性全局 BA
+        # 6. 周期性中等 BA
         # ------------------------------------------------
         if global_ba_every is not None and iteration % global_ba_every == 0:
-            print("执行周期性全局 BA")
+            print("执行周期性中等 BA")
 
             camera_poses, points3D, camera_intrinsics = run_sfm_bundle_adjustment(
                 camera_poses=camera_poses,
@@ -1859,11 +1731,11 @@ def incremental_sfm_expansion(
                 refine_focal_min_images=5,
                 refine_focal_min_points=150,
                 refine_focal_min_observations=500,
-                fixed_K_max_nfev=3,
-                refine_focal_max_nfev=3
+                fixed_K_max_nfev=30,
+                refine_focal_max_nfev=30
             )
 
-            print(f"周期性 BA 后焦距 f：{camera_intrinsics['f']:.3f}")
+            print(f"周期性中等 BA 后焦距 f：{camera_intrinsics['f']:.3f}")
 
     # ------------------------------------------------
     # 7. 最终全局 BA
@@ -1881,8 +1753,8 @@ def incremental_sfm_expansion(
             refine_focal_min_images=5,
             refine_focal_min_points=150,
             refine_focal_min_observations=500,
-            fixed_K_max_nfev=3,
-            refine_focal_max_nfev=3
+            fixed_K_max_nfev=100,
+            refine_focal_max_nfev=100
         )
 
     print("\n========== 增量 SfM 结束 ==========")
@@ -2049,13 +1921,13 @@ def main():
             if num_prime_matches < min_good_matches: #如果初步匹配点数量过少，说明两张图的内容差异较大，跳过后续步骤
                 continue
 
-            # 第二步：进行F矩阵的估计
-            F, inlier_matches, inlier_mask, info = estimate_fundamental_matrix(kp1, kp2, prime_matches)
+            # 第二步：使用 OpenCV 内置 RANSAC 进行 F 矩阵的估计
+            F, inlier_matches, inlier_mask = estimate_fundamental_matrix_opencv_ransac(kp1, kp2, prime_matches)
 
             if F is None or inlier_matches is None:
                 continue
             num_inliers = len(inlier_matches)
-            inlier_ratio = info["inlier_ratio"]
+            inlier_ratio = num_inliers / num_prime_matches if num_prime_matches > 0 else 0.0
             if num_inliers < min_inlier_matches or inlier_ratio < min_inlier_ratio:
                 continue
 
@@ -2070,8 +1942,7 @@ def main():
                 "num_prime_matches": num_prime_matches,
                 "num_inliers": num_inliers,
                 "inlier_ratio": inlier_ratio,
-                "weight": info["best_score"] * inlier_ratio,
-                "info": info
+                "weight": num_inliers * inlier_ratio,
             }
 
             for m in inlier_matches:
@@ -2089,7 +1960,7 @@ def main():
     initial_pair_result = select_initial_pair(
         pair_infos=pair_infos,
         all_results=all_results,
-        min_pose_inliers=30,
+        min_pose_inliers=20,
         min_triangulated_points=30,
         min_angle_deg=3.0,
         max_angle_deg=70.0,
@@ -2105,19 +1976,15 @@ def main():
     init_i, init_j = initial_pair_result["pair"]
     K_init = initial_pair_result["K"]
     R_init = initial_pair_result["R"]
-    t_init = initial_pair_result["t"].reshape(3, 1)
-    camera_intrinsics = {
-        "K": K_init,
-        "fx": K_init[0, 0],
-        "fy": K_init[1, 1],
-        "cx": K_init[0, 2],
-        "cy": K_init[1, 2],
-        "refine_in_BA": True
-    }
+    t_init = initial_pair_result["t"]
     camera_poses = {}
     camera_poses[init_i] = {
         "R": np.eye(3, dtype=np.float64),
         "t": np.zeros((3, 1), dtype=np.float64)
+    }
+    camera_poses[init_j] = {
+        "R": R_init,
+        "t": t_init.reshape(3, 1)
     }
     registered_images = set([init_i, init_j]) # 已经注册到 SfM 中的图像编号集合
     initial_points_3d = initial_pair_result["points_3d"]
@@ -2189,8 +2056,8 @@ def main():
         point3D_to_track=point3D_to_track,
         all_results=all_results,
         camera_intrinsics=camera_intrinsics,
-        min_common_points=20,
-        min_pnp_points=20,
+        min_common_points=15,
+        min_pnp_points=15,
         ba_every_iteration=True,
         global_ba_every=5
     )
